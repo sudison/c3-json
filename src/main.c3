@@ -5,6 +5,7 @@ import std::collections::object;
 import std::io::path;
 import std::io::file;
 import std::collections::list;
+import std::time;
 import json;
 
 // Test results tracking
@@ -142,6 +143,53 @@ fn void test_jsonchecker_file(String filepath, TestResults* results)
     }
 }
 
+// Test a single large JSON file for performance
+fn void test_performance_file(String filepath, TestResults* results)
+{
+    results.total_tests++;
+
+    // Extract filename from path
+    String filename = path::new(allocator::heap(), filepath)!!.basename();
+
+    io::printfn("Testing performance: %s", filename);
+
+    // Measure file loading time
+    Clock load_start = clock::now();
+    char[] content = file::load_temp(filepath)!!;
+    NanoDuration load_time = load_start.mark();
+
+    // Get file size for reporting
+    usz file_size = content.len;
+
+    // Measure parsing time
+    Clock parse_start = clock::now();
+    Object*? parsed_result = json::tparse_string((String)content);
+    NanoDuration parse_time = parse_start.mark();
+
+    bool parse_succeeded = !@catch(parsed_result);
+
+    if (parse_succeeded)
+    {
+        io::printfn("  ✓ SUCCESS: %s", filename);
+        io::printfn("    File size: %d bytes (%.2f KB)", file_size, (double)file_size / 1024.0);
+        io::printfn("    Load time: %s", load_time);
+        io::printfn("    Parse time: %s", parse_time);
+        io::printfn("    Total time: %s", load_time + parse_time);
+        io::printfn("    Parse speed: %.2f MB/s", (double)file_size / (1024.0 * 1024.0) / parse_time.to_sec());
+        results.passed_tests++;
+    }
+    else
+    {
+        io::printfn("  ❌ FAILED: %s", filename);
+        io::printfn("    File size: %d bytes (%.2f KB)", file_size, (double)file_size / 1024.0);
+        io::printfn("    Load time: %s", load_time);
+        io::printfn("    Parse time: %s (failed)", parse_time);
+        results.failed_tests++;
+    }
+
+    io::printn("");
+}
+
 // Get all JSON files from the test_parsing directory
 fn String[] get_test_files(Allocator allocator)
 {
@@ -171,6 +219,31 @@ fn String[] get_test_files(Allocator allocator)
 fn String[] get_jsonchecker_files(Allocator allocator)
 {
     String test_dir = "test/jsonchecker";
+
+    List{String} files;
+    files.init(allocator);
+
+    // List all files in the directory
+    PathList dir_list = path::ls(allocator, path::new(allocator, test_dir)!!)!!;
+    defer dir_list.free();
+
+    foreach (path_entry : dir_list)
+    {
+        String filename = path_entry.basename();
+        if (filename.ends_with(".json"))
+        {
+            String full_path = test_dir.tconcat("/").tconcat(filename);
+            files.push(full_path.copy(allocator));
+        }
+    }
+
+    return files.array_view();
+}
+
+// Get all JSON files from the performance test data directory
+fn String[] get_performance_test_files(Allocator allocator)
+{
+    String test_dir = "test/data";
 
     List{String} files;
     files.init(allocator);
@@ -286,6 +359,57 @@ fn void test_jsonchecker_suite()
     }
 }
 
+// Performance test function
+fn void test_performance_suite()
+{
+    io::printn("Starting JSON Performance Test Suite");
+    io::printn("====================================");
+
+    TestResults results = {};
+
+    // Get all performance test files
+    String[] test_files = get_performance_test_files(allocator::heap());
+    defer
+    {
+        foreach (file : test_files)
+        {
+            allocator::free(allocator::heap(), file);
+        }
+        allocator::free(allocator::heap(), test_files);
+    }
+
+    io::printfn("Found %d large JSON test files", test_files.len);
+    io::printn("");
+
+    // Measure total time for all tests
+    Clock total_start = clock::now();
+
+    // Test each file
+    foreach (filepath : test_files)
+    {
+        test_performance_file(filepath, &results);
+    }
+
+    NanoDuration total_time = total_start.mark();
+
+    // Print summary
+    io::printn("Performance Test Summary");
+    io::printn("========================");
+    io::printfn("Total tests: %d", results.total_tests);
+    io::printfn("Passed: %d", results.passed_tests);
+    io::printfn("Failed: %d", results.failed_tests);
+    io::printfn("Total execution time: %s", total_time);
+
+    if (results.failed_tests > 0)
+    {
+        io::printfn("❌ %d performance tests failed", results.failed_tests);
+    }
+    else
+    {
+        io::printn("All performance tests passed! ✓");
+    }
+}
+
 
 fn int main(String[] args)
 {
@@ -293,5 +417,8 @@ fn int main(String[] args)
     io::printn("");
     io::printn("");
     test_jsonchecker_suite();
+    io::printn("");
+    io::printn("");
+    test_performance_suite();
     return 0;
 }
