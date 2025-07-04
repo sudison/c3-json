@@ -52,14 +52,8 @@ fn void test_json_file(String filepath, TestResults* results)
     char[] content = file::load_temp(filepath)!!;
 
     // Try to parse the JSON
-    Object*? parsed_result = json::parse_string(mem, (String)content);
+    Object*? parsed_result = json::tparse_string((String)content);
     bool parse_succeeded = !@catch(parsed_result);
-
-    // Clean up if parsing succeeded
-    if (parse_succeeded)
-    {
-        defer parsed_result!!.free();
-    }
 
     // Check the result against expectations
     if (is_implementation_defined)
@@ -85,10 +79,98 @@ fn void test_json_file(String filepath, TestResults* results)
     }
 }
 
+// Test a single JSON file from jsonchecker directory
+fn void test_jsonchecker_file(String filepath, TestResults* results)
+{
+    results.total_tests++;
+
+    // Extract filename from path
+    String filename = path::new(allocator::heap(), filepath)!!.basename();
+
+    // Determine expected behavior based on filename prefix
+    bool should_accept;
+    bool should_skip = false;
+
+    if (filename.starts_with("fail"))
+    {
+        should_accept = false;
+        // Skip files with _EXCLUDE suffix as they might be special cases
+        if (filename.contains("_EXCLUDE"))
+        {
+            should_skip = true;
+        }
+    }
+    else if (filename.starts_with("pass"))
+    {
+        should_accept = true;
+    }
+    else
+    {
+        io::printfn("SKIP: Unknown prefix for file %s", filename);
+        results.skipped_tests++;
+        return;
+    }
+
+    if (should_skip)
+    {
+        io::printfn("SKIP: %s (excluded file)", filename);
+        results.skipped_tests++;
+        return;
+    }
+
+    // Read the JSON file content
+    char[] content = file::load_temp(filepath)!!;
+
+    // Try to parse the JSON
+    Object*? parsed_result = json::tparse_string((String)content);
+    bool parse_succeeded = !@catch(parsed_result);
+
+    // Check the result against expectations
+    if (parse_succeeded == should_accept)
+    {
+        io::printfn("PASS: %s (%s as expected)",
+                   filename, should_accept ? "accepted" : "rejected");
+        results.passed_tests++;
+    }
+    else
+    {
+        io::printfn("FAIL: %s (expected %s, got %s)",
+                   filename,
+                   should_accept ? "accept" : "reject",
+                   parse_succeeded ? "accept" : "reject");
+        results.failed_tests++;
+    }
+}
+
 // Get all JSON files from the test_parsing directory
 fn String[] get_test_files(Allocator allocator)
 {
     String test_dir = "test/test_parsing";
+
+    List{String} files;
+    files.init(allocator);
+
+    // List all files in the directory
+    PathList dir_list = path::ls(allocator, path::new(allocator, test_dir)!!)!!;
+    defer dir_list.free();
+
+    foreach (path_entry : dir_list)
+    {
+        String filename = path_entry.basename();
+        if (filename.ends_with(".json"))
+        {
+            String full_path = test_dir.tconcat("/").tconcat(filename);
+            files.push(full_path.copy(allocator));
+        }
+    }
+
+    return files.array_view();
+}
+
+// Get all JSON files from the jsonchecker directory
+fn String[] get_jsonchecker_files(Allocator allocator)
+{
+    String test_dir = "test/jsonchecker";
 
     List{String} files;
     files.init(allocator);
@@ -157,11 +239,59 @@ fn void test_json_parsing_suite()
     }
 }
 
+// JSONChecker test function
+fn void test_jsonchecker_suite()
+{
+    io::printn("Starting JSONChecker Test Suite");
+    io::printn("===============================");
+
+    TestResults results = {};
+
+    // Get all jsonchecker test files
+    String[] test_files = get_jsonchecker_files(allocator::heap());
+    defer
+    {
+        foreach (file : test_files)
+        {
+            allocator::free(allocator::heap(), file);
+        }
+        allocator::free(allocator::heap(), test_files);
+    }
+
+    io::printfn("Found %d jsonchecker test files", test_files.len);
+    io::printn("");
+
+    // Test each file
+    foreach (filepath : test_files)
+    {
+        test_jsonchecker_file(filepath, &results);
+    }
+
+    // Print summary
+    io::printn("");
+    io::printn("JSONChecker Test Summary");
+    io::printn("========================");
+    io::printfn("Total tests: %d", results.total_tests);
+    io::printfn("Passed: %d", results.passed_tests);
+    io::printfn("Failed: %d", results.failed_tests);
+    io::printfn("Skipped: %d", results.skipped_tests);
+
+    if (results.failed_tests > 0)
+    {
+        io::printfn("❌ %d tests failed", results.failed_tests);
+    }
+    else
+    {
+        io::printn("All tests passed! ✓");
+    }
+}
+
 
 fn int main(String[] args)
 {
-	io::printn("Hello, World!");
-
     test_json_parsing_suite();
-	return 0;
+    io::printn("");
+    io::printn("");
+    test_jsonchecker_suite();
+    return 0;
 }
