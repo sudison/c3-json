@@ -6,7 +6,10 @@
  Unmarshal json string to a struct.
 *>
 module json;
-import std::collections::object;
+import std::io;
+import std::collections::list;
+
+faultdef TYPE_MISMATCH;
 
 <*
  * Unmarshal JSON string to target type.
@@ -17,46 +20,82 @@ import std::collections::object;
 *>
 macro unmarshal($TargetType, String json_string, Allocator allocator)
 {
-    Object* json_obj = parse_string(allocator, json_string)!;
-    defer (void)json_obj.free();
+    @stack_mem(512; Allocator smem)
+    {
+        JsonContext context = {
+            .last_string = dstring::new_with_capacity(smem, 64),
+            .stream = (ByteReader){}.init(json_string),
+            .allocator = allocator
+        };
 
-    return convert_json_value($TargetType, json_obj, allocator);
+        $TargetType result = direct_parse_value($TargetType, &context)!;
+
+        // Verify no trailing content
+        while (char c = read_next(&context)!, c != 0)
+        {
+            if (c.is_space()) continue;
+            return UNEXPECTED_CHARACTER?;
+        }
+        if (context.stream.available() ?? 0) return UNEXPECTED_CHARACTER?;
+
+        return result;
+    };
+}
+
+// -- Direct parsing implementation using existing tokenizer --
+
+<*
+ * Parse a JSON value directly into the target type
+ * @param $TargetType: The target type to parse into
+ * @param context: The parsing context
+ * @return The parsed value
+*>
+macro direct_parse_value($TargetType, JsonContext* context)
+{
+    JsonTokenType token = advance(context)!;
+    return parse_value_from_token($TargetType, context, token);
 }
 
 <*
- * Helper macro to convert JSON Object value to the target type
- * @param [in] $TargetType The target type to convert to
- * @param [in] json_obj The JSON Object to convert from
- * @param [in] allocator The allocator for string copying
- * @return The converted value
+ * Parse a JSON value from a token directly into the target type
+ * @param $TargetType: The target type to parse into
+ * @param context: The parsing context
+ * @param token: The current token
+ * @return The parsed value
 *>
-macro convert_json_value($TargetType, Object* json_obj, Allocator allocator)
+macro parse_value_from_token($TargetType, JsonContext* context, JsonTokenType token)
 {
     $switch $TargetType.kindof:
         $case SIGNED_INT:
-            // JSON numbers are always floats, so allow float-to-int conversion
-            if (!json_obj.is_float()) return TYPE_MISMATCH?;
-            return ($TargetType)json_obj.f;
+            if (token != JsonTokenType.NUMBER) return TYPE_MISMATCH?;
+            return ($TargetType)context.last_number;
         $case UNSIGNED_INT:
-            // JSON numbers are always floats, so allow float-to-int conversion
-            if (!json_obj.is_float()) return TYPE_MISMATCH?;
-            return ($TargetType)json_obj.f;
+            if (token != JsonTokenType.NUMBER) return TYPE_MISMATCH?;
+            return ($TargetType)context.last_number;
         $case FLOAT:
-            if (!json_obj.is_float()) return TYPE_MISMATCH?;
-            return ($TargetType)json_obj.f;
+            if (token != JsonTokenType.NUMBER) return TYPE_MISMATCH?;
+            return ($TargetType)context.last_number;
         $case BOOL:
-            if (!json_obj.is_bool()) return TYPE_MISMATCH?;
-            return json_obj.b;
+            switch (token)
+            {
+                case JsonTokenType.TRUE: return true;
+                case JsonTokenType.FALSE: return false;
+                default: return TYPE_MISMATCH?;
+            }
         $case ENUM:
-            if (!json_obj.is_string()) return TYPE_MISMATCH?;
-            return unmarshal_enum($TargetType, json_obj.s)!;
+            if (token != JsonTokenType.STRING) return TYPE_MISMATCH?;
+            return unmarshal_enum($TargetType, context.last_string.str_view())!;
         $case STRUCT:
-            if (!json_obj.is_map()) return TYPE_MISMATCH?;
-            return unmarshal_struct($TargetType, json_obj, allocator)!;
+            if (token != JsonTokenType.LBRACE) return TYPE_MISMATCH?;
+            return direct_parse_struct($TargetType, context)!;
+        $case ARRAY:
+        $case SLICE:
+            if (token != JsonTokenType.LBRACKET) return TYPE_MISMATCH?;
+            return direct_parse_array($TargetType, context)!;
         $default:
             $if $TargetType.typeid == String.typeid:
-                if (!json_obj.is_string()) return TYPE_MISMATCH?;
-                return json_obj.s.tcopy();
+                if (token != JsonTokenType.STRING) return TYPE_MISMATCH?;
+                return context.last_string.str_view().tcopy();
             $else
                 return TYPE_MISMATCH?;
             $endif
@@ -64,43 +103,70 @@ macro convert_json_value($TargetType, Object* json_obj, Allocator allocator)
 }
 
 <*
- * Unmarshal JSON Object to a struct
- * @param $StructType: The struct type to unmarshal to
- * @param json_obj: The JSON Object to unmarshal from
- * @param allocator: The allocator to use for string copying
- * @require @typekind($StructType) == STRUCT
- * @return The unmarshaled struct value
+ * Parse a JSON object directly into a struct
+ * @param $StructType: The struct type to parse into
+ * @param context: The parsing context
+ * @return The parsed struct value
 *>
-macro unmarshal_struct($StructType, Object* json_obj, Allocator allocator)
+macro direct_parse_struct($StructType, JsonContext* context)
 {
-    if (!json_obj.is_map()) return TYPE_MISMATCH?;
-
     $StructType result;
+    JsonTokenType token = advance(context)!;
+    defer context.depth--;
+    if (++context.depth >= max_depth) return json::MAX_DEPTH_REACHED?;
 
-    $foreach $member : $StructType.membersof:
-        $if $member.nameof != "":
+    @stack_mem(256; Allocator mem)
+    {
+        DString temp_key = dstring::new_with_capacity(mem, 32);
+        while (token != JsonTokenType.RBRACE)
+        {
+            if (token != JsonTokenType.STRING) return UNEXPECTED_CHARACTER?;
+
+            // Copy the key to our temp holder
+            temp_key.clear();
+            temp_key.append(context.last_string);
+            String field_name = temp_key.str_view();
+
+            parse_expected(context, JsonTokenType.COLON)!;
+
+            // Find matching struct field and parse value directly
+            bool field_found = false;
+            $foreach $member : $StructType.membersof:
+                $if $member.nameof != "":
+                    if (field_name == $member.nameof)
+                    {
+                        var $FieldType = $member.typeid;
+                        $if $FieldType.kindof == ARRAY || $FieldType.kindof == SLICE:
+                            // For arrays, we need to parse them specially
+                            JsonTokenType value_token = advance(context)!;
+                            if (value_token != JsonTokenType.LBRACKET) return TYPE_MISMATCH?;
+                            $FieldType array_result = direct_parse_array($FieldType, context)!;
+                            result.$eval($member.nameof) = array_result;
+                        $else
+                            // For non-arrays, use the standard parsing
+                            $FieldType field_value = direct_parse_value($FieldType, context)!;
+                            result.$eval($member.nameof) = field_value;
+                        $endif
+                        field_found = true;
+                    }
+                $endif
+            $endforeach
+
+            // Field not found in struct, skip the value
+            if (!field_found)
             {
-                // Get the JSON value for this field
-                Object*? field_obj = json_obj.get($member.nameof);
-                if (try field_obj)
-                {
-                	// Convert JSON value to struct field based on type
-                	var $FieldType = $member.typeid;
-                	$if $FieldType.kindof == ARRAY || $FieldType.kindof == SLICE:
-                    	if (!field_obj.is_array()) return TYPE_MISMATCH?;
-                    	$FieldType array_result = unmarshal_array($FieldType, field_obj, allocator)!;
-                    	result.$eval($member.nameof) = array_result;
-                	$else
-                    	$FieldType converted_value = convert_json_value($FieldType, field_obj, allocator)!;
-                    	result.$eval($member.nameof) = converted_value;
-                	$endif
-                }
-                // If field not found in JSON, use default value (do nothing)
+                skip_json_value(context)!;
             }
-        $endif
-    $endforeach
-
-    return result;
+            token = advance(context)!;
+            if (token == JsonTokenType.COMMA)
+            {
+                token = advance(context)!;
+                continue;
+            }
+            if (token != JsonTokenType.RBRACE) return UNEXPECTED_CHARACTER?;
+        }
+        return result;
+    };
 }
 
 <*
@@ -121,45 +187,175 @@ macro unmarshal_enum($EnumType, String enum_name)
 }
 
 <*
- * Unmarshal a JSON array to an array or slice
- * @param [in] $ArrayType The array/slice type to unmarshal to
- * @param [in] json_array The JSON array Object to unmarshal from
- * @param [in] allocator The allocator to use for memory allocation
- * @return The unmarshaled array/slice value
+ * Parse a JSON array directly into an array or slice
+ * @param $ArrayType: The array/slice type to parse into
+ * @param context: The parsing context
+ * @return The parsed array/slice value
 *>
-macro unmarshal_array($ArrayType, Object* json_array, Allocator allocator)
+macro direct_parse_array($ArrayType, JsonContext* context)
 {
     var $ElementType = $ArrayType.inner;
+    defer context.depth--;
+    if (++context.depth >= max_depth) return json::MAX_DEPTH_REACHED?;
 
-    if (!json_array.is_array()) return TYPE_MISMATCH?;
+    // The LBRACKET token has already been consumed, start parsing elements
+    JsonTokenType token = advance(context)!;
 
-    usz array_len = json_array.get_len();
-
-    // Allocate result based on type
+    // For slices, we need to collect elements in a dynamic way
     $if $ArrayType.kindof == SLICE:
-        // For slices, allocate memory using temp allocator
-        $ElementType[] result = allocator::alloc_array(tmem, $ElementType, array_len);
-    $else
-        // For fixed arrays, check size compatibility
-        if (array_len > $ArrayType.len)
+        // Use List with context allocator for temporary allocation
+        List{$ElementType} temp_list;
+        temp_list.init(context.allocator);
+        defer temp_list.free();
+
+        while (token != JsonTokenType.RBRACKET)
         {
-            return TYPE_MISMATCH?; // Array too large
+            $ElementType element = parse_value_from_token($ElementType, context, token)!;
+            temp_list.push(element);
+
+            token = advance(context)!;
+            if (token == JsonTokenType.COMMA)
+            {
+                token = advance(context)!;
+                continue;
+            }
+            if (token != JsonTokenType.RBRACKET) return UNEXPECTED_CHARACTER?;
         }
+
+        // Convert List to slice using to_array
+        return temp_list.to_array(context.allocator);
+    $else
+        // For fixed arrays
         $ArrayType result;
+        usz array_len = 0;
+
+        while (token != JsonTokenType.RBRACKET)
+        {
+            if (array_len >= $ArrayType.len) return TYPE_MISMATCH?; // Array too large
+            result[array_len] = parse_value_from_token($ElementType, context, token)!;
+            array_len++;
+
+            token = advance(context)!;
+            if (token == JsonTokenType.COMMA)
+            {
+                token = advance(context)!;
+                continue;
+            }
+            if (token != JsonTokenType.RBRACKET) return UNEXPECTED_CHARACTER?;
+        }
+        return result;
     $endif
+}
 
-    // Fill the array/slice with values
-    for (usz i = 0; i < array_len; i++)
+<*
+ * Skip a JSON value without parsing it
+ * @param context: The parsing context
+*>
+fn void? skip_json_value(JsonContext* context) @local
+{
+    JsonTokenType token = advance(context)!;
+    switch (token)
     {
-        Object* element_obj = json_array.get_at(i);
-        if (!element_obj) return TYPE_MISMATCH?;
-
-        // Use the unified conversion helper
-        $ElementType converted_value = convert_json_value($ElementType, element_obj, allocator)!;
-        result[i] = converted_value;
+        case JsonTokenType.LBRACE:
+            // Skip object
+            defer context.depth--;
+            if (++context.depth >= max_depth) return json::MAX_DEPTH_REACHED?;
+            token = advance(context)!;
+            while (token != JsonTokenType.RBRACE)
+            {
+                if (token != JsonTokenType.STRING) return UNEXPECTED_CHARACTER?;
+                parse_expected(context, JsonTokenType.COLON)!;
+                skip_json_value(context)!; // Recursively skip value
+                token = advance(context)!;
+                if (token == JsonTokenType.COMMA)
+                {
+                    token = advance(context)!;
+                    continue;
+                }
+                if (token != JsonTokenType.RBRACE) return UNEXPECTED_CHARACTER?;
+            }
+            break;
+        case JsonTokenType.LBRACKET:
+            // Skip array
+            defer context.depth--;
+            if (++context.depth >= max_depth) return json::MAX_DEPTH_REACHED?;
+            token = advance(context)!;
+            while (token != JsonTokenType.RBRACKET)
+            {
+                skip_json_value_from_token(context, token)!; // Skip element with current token
+                token = advance(context)!;
+                if (token == JsonTokenType.COMMA)
+                {
+                    token = advance(context)!;
+                    continue;
+                }
+                if (token != JsonTokenType.RBRACKET) return UNEXPECTED_CHARACTER?;
+            }
+            break;
+        case JsonTokenType.STRING:
+        case JsonTokenType.NUMBER:
+        case JsonTokenType.TRUE:
+        case JsonTokenType.FALSE:
+        case JsonTokenType.NULL:
+            // These are atomic values, nothing more to skip
+            break;
+        default:
+            return UNEXPECTED_CHARACTER?;
     }
+}
 
-    return result;
-
+<*
+ * Skip a JSON value from a given token without advancing first
+ * @param context: The parsing context
+ * @param token: The current token
+*>
+fn void? skip_json_value_from_token(JsonContext* context, JsonTokenType token) @local
+{
+    switch (token)
+    {
+        case JsonTokenType.LBRACE:
+            // Skip object
+            defer context.depth--;
+            if (++context.depth >= max_depth) return json::MAX_DEPTH_REACHED?;
+            token = advance(context)!;
+            while (token != JsonTokenType.RBRACE)
+            {
+                if (token != JsonTokenType.STRING) return UNEXPECTED_CHARACTER?;
+                parse_expected(context, JsonTokenType.COLON)!;
+                skip_json_value(context)!; // Recursively skip value
+                token = advance(context)!;
+                if (token == JsonTokenType.COMMA)
+                {
+                    token = advance(context)!;
+                    continue;
+                }
+                if (token != JsonTokenType.RBRACE) return UNEXPECTED_CHARACTER?;
+            }
+        case JsonTokenType.LBRACKET:
+            // Skip array
+            defer context.depth--;
+            if (++context.depth >= max_depth) return json::MAX_DEPTH_REACHED?;
+            token = advance(context)!;
+            while (token != JsonTokenType.RBRACKET)
+            {
+                skip_json_value_from_token(context, token)!; // Skip element with current token
+                token = advance(context)!;
+                if (token == JsonTokenType.COMMA)
+                {
+                    token = advance(context)!;
+                    continue;
+                }
+                if (token != JsonTokenType.RBRACKET) return UNEXPECTED_CHARACTER?;
+            }
+        case JsonTokenType.STRING:
+        case JsonTokenType.NUMBER:
+        case JsonTokenType.TRUE:
+        case JsonTokenType.FALSE:
+        case JsonTokenType.NULL:
+            // These are atomic values, nothing more to skip
+            break;
+        default:
+            return UNEXPECTED_CHARACTER?;
+    }
 }
 
