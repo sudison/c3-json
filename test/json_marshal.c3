@@ -209,6 +209,18 @@ fn void test_fixed_array_unmarshal() @test
     }
 }
 
+fn void test_string_unescaping() @test
+{
+    // Test that JSON string escape sequences are properly unescaped
+    String json = `{"name": "Hello \"World\"\nNew Line\tTab\\Backslash"}`;
+
+    SimpleData result = json::unmarshal(SimpleData, json, tmem)!!;
+
+    // Verify that escape sequences are properly unescaped
+    String expected = "Hello \"World\"\nNew Line\tTab\\Backslash";
+    assert(result.name == expected);
+}
+
 fn void test_skip_unknown_fields() @test
 {
     // Test JSON with various types of unknown fields that should be skipped

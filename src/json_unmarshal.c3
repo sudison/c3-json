@@ -3,7 +3,7 @@
 // a copy of which can be found in the LICENSE_STDLIB file.
 
 <*
- Unmarshal json string to a struct.
+ Unmarshal json string to target type.
 *>
 module json;
 import std::io;
